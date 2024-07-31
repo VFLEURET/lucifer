@@ -1,2 +1,7 @@
+*.egg-info
+.vscode
+build/*
+.DS_Store
+ve/
 *.d
 *.o

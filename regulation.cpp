@@ -8,8 +8,9 @@
 #include "temperature.h"
 #include "regulation.h"
 #include "display.h"
-#include <arduino.h>
+#include <Arduino.h>
 #include "src/hardware/PID_v1.h"
+#include "log.h"
 
 int time_palier1_extern;
 int time_palier2_extern;
@@ -17,24 +18,27 @@ int pente1_extern;
 int pente2_extern;
 int temp_1_extern;
 int temp_2_extern;
+int start_temp;
+
 unsigned long start_time;
 int step;
 
 #define ambiant_temp  30
 #define relais_pin     5
 
-
-
 //Specify the links and initial tuning parameters
 double Setpoint, Input, Output;
-double Kp=2, Ki=5, Kd=1;
+double Kp=10, Ki=0, Kd=0;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
-int WindowSize = 2000;
-unsigned long windowStartTime;
+int window_size_ms = 1000;
+int max_output = 100;
+
+unsigned long window_start_time_ms;
 
 void init_pid(void) {
-    myPID.SetOutputLimits(0, WindowSize);
-    windowStartTime = millis();
+    myPID.SetOutputLimits(0, max_output);
+    window_start_time_ms = millis();
+
     //turn the PID on
     myPID.SetMode(AUTOMATIC);
 }
@@ -55,12 +59,19 @@ void burn_regulation(void)
      run_time = millis() -  start_time;
      refresh_temp_burn(temp, int(run_time/60000), step);
 
+    
      switch(step) {
      case step_one :
-         if (pente1_extern)
-             temp_consigne = (int)((float)(temp_1_extern) * (float)(run_time)/((float)(pente1_extern)*60000)) + ambiant_temp;
-         if (temp_consigne > temp_1_extern)
-             temp_consigne = temp_1_extern;
+        // This is not really correct as pente1_extern should take the current temperature into account as well
+        if (pente1_extern)
+        {
+            temp_consigne = (int)((float)(temp_1_extern - start_temp) * (float)(run_time)/((float)(pente1_extern)*60000)) + start_temp;
+        }
+
+        if (temp_consigne > temp_1_extern)
+        {
+            temp_consigne = temp_1_extern;
+        }
 
         Setpoint = (double)(temp_consigne);
         Input = (double)(temp);
@@ -72,18 +83,21 @@ void burn_regulation(void)
              step = step_two;
              change_page(step);
              refresh_temp_burn(temp, int(run_time/60000), step);
-             Serial.print(F("step Two !!"));
-             Serial.println(time_step_two);
+             logging::log_console("MSG_REGULATION", logging::severity::INFO, "step two");
          }
          break;
 
      case step_two :
          temp_consigne = temp_1_extern;
 
+        Setpoint = (double)(temp_consigne);
+        Input = (double)(temp);
+        myPID.Compute();
+        
          if (run_time > time_step_two)
          {
              step = step_three;
-             Serial.println(F("step Three !!"));
+             logging::log_console("MSG_REGULATION", logging::severity::INFO, "step three");
              change_page(step);
              refresh_temp_burn(temp, int(run_time/60000), step);
          }
@@ -91,32 +105,43 @@ void burn_regulation(void)
          break;
 
      case step_three :
-         if (pente2_extern)
-             temp_consigne = (int)((float)(temp_2_extern-temp_1_extern) * (float)(run_time)/((float)(pente2_extern)*60000)) + temp_1_extern;
-         if (temp_consigne > temp_2_extern)
-             temp_consigne = temp_2_extern;
+        if (pente2_extern)
+        {
+            temp_consigne = (int)((float)(temp_2_extern-temp_1_extern) * (float)(run_time - time_step_two)/((float)(pente2_extern)*60000)) + temp_1_extern;
+        }
+        if (temp_consigne > temp_2_extern)
+        {
+            temp_consigne = temp_2_extern;
+        }
 
-         if ((temp > temp_2_extern) || (pente2_extern == 0))
-         {
-             time_step_four = run_time + (time_palier2_extern * 60000); //en ms
-             step = step_four;
-             change_page(step);
-             refresh_temp_burn(temp, int(run_time/60000), step);
-             Serial.print(F("step four !!"));
-             Serial.println(time_step_four);
-         }
+        Setpoint = (double)(temp_consigne);
+        Input = (double)(temp);
+        myPID.Compute();
+        
+        if ((temp > temp_2_extern) || (pente2_extern == 0))
+        {
+            time_step_four = run_time + (time_palier2_extern * 60000); //en ms
+            step = step_four;
+            change_page(step);
+            refresh_temp_burn(temp, int(run_time/60000), step);
+            logging::log_console("MSG_REGULATION", logging::severity::INFO, "step four");
+        }
 
-         break;
+        break;
 
      case step_four :
-         temp_consigne = temp_2_extern;
+        temp_consigne = temp_2_extern;
 
+        Setpoint = (double)(temp_consigne);
+        Input = (double)(temp);
+        myPID.Compute();
+        
          if (run_time > time_step_four)
          {
              step = step_five;
              change_page(step);
              refresh_temp_burn(temp, int(run_time/60000), step);
-             Serial.println(F("step Five !!"));
+             logging::log_console("MSG_REGULATION", logging::severity::INFO, "step five");
          }
          break;
 
@@ -128,37 +153,60 @@ void burn_regulation(void)
          break;
      }
 
-     Serial.print(F("time "));
-     Serial.print(run_time);
-     Serial.print(F(";T :"));
-     Serial.print(temp);
-     Serial.print(F(";Tc :"));
-     Serial.println(temp_consigne);
+
+    logging::log("REGULATION",
+                 run_time,
+                 temp,
+                 temp_consigne,
+                 Output,
+                 Kp,
+                 Ki,
+                 Kd);
 
      timeout_1s_flag = false;
 }
 
 void compute_pid(void) {
-    
-    static bool on_off_heat;
 
-    if ((millis() - windowStartTime) > WindowSize)
+    if ((millis() - window_start_time_ms) > window_size_ms)
     { //time to shift the Relay Window
-      windowStartTime += WindowSize;
+      window_start_time_ms += window_size_ms;
     }
-
-    if (Output < (millis() - windowStartTime))
+    // Assume Output [-1, 1] but really [0, 1] since no action to cool down (potentially we could add a feedforward based on temp_cons)
+    double output_pid_constrained = constrain(Output/static_cast<double>(max_output), 0.0, 1.0);
+    bool on_off_heat = 0;
+    double window_threshold_ms = output_pid_constrained * window_size_ms;
+    if ((millis() - window_start_time_ms) > window_threshold_ms)
+    {
       on_off_heat = 0;
+    }
     else
+    {
       on_off_heat = 1;
+    }    
+
+    static int counter = 0;
+    counter++;
+
+    if(counter % 100 == 0)
+    {
+      counter = 0;
+      logging::log("ACTUATOR",
+                   millis(),
+                   Output,
+                   output_pid_constrained, 
+                   window_start_time_ms,
+                   window_threshold_ms,
+                   on_off_heat);
+    }
 
     digitalWrite(relais_pin, on_off_heat);
     flamme_display(on_off_heat);
-
 }
 
 void burn_stop(void)
 {
     digitalWrite(relais_pin, false);
+    // logging::log_console("MSG_REGULATION", logging::severity::INFO, "burn_stop");
 }
 
